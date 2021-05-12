@@ -11,6 +11,30 @@ from spin.utils.renderer import Renderer
 import spin.config
 import spin.constants
 
+import urllib
+from pathlib import Path
+from textwrap import dedent
+
+import cv2
+import PIL.Image as Image
+import PIL.ImageDraw as ImageDraw
+import requests
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+
+from g2pe.src.utils import get_final_preds, get_input, put_kps, KPS, SKELETON
+
+from utils import ROOT_PATH, ASSETS_PATH, DESIRED_SIZE, DEFAULT_IMG_FILEPATH, DEFAULT_IMG_URLPATH, MODEL_FILEPATH, MODEL_URLPATH, KPS_SPIN_MAP
+
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+from os import listdir
+import glob
+import os
+from random import randint 
+from utils import MODEL_HMR_PATH, LOAD_DIR, SAVE_DIR, IDXS_MAP
+
 def bbox_from_openpose(openpose_file, rescale=1.2, detection_thresh=0.2):
     """Get center and scale for bounding box from openpose detections."""
     with open(openpose_file, 'r') as f:
@@ -62,26 +86,20 @@ def process_image_spin(img_file, bbox_file, openpose_file, input_res=224):
     norm_img = normalize_img(img.clone())[None]
     return img, norm_img
 
+def g2pe_coordinate_transformation(img, predicted_keypoints):
+    img = Image.fromarray(img[..., ::-1])
+    original_img_size = img.size
+    ratio = float(DESIRED_SIZE) / max(original_img_size)
+    resized_img_size = tuple([int(x * ratio) for x in original_img_size])
+    img = img.resize(resized_img_size, Image.ANTIALIAS)
+    original_img_size = max(original_img_size)
+
+    predicted_keypoints *= (DESIRED_SIZE - 1) / (original_img_size - 1)
+    
+    return predicted_keypoints, img, resized_img_size
 
 
-
-import urllib
-from pathlib import Path
-from textwrap import dedent
-
-import cv2
-import PIL.Image as Image
-import requests
-
-from g2pe.src.utils import get_final_preds, get_input, put_kps, KPS, SKELETON
-
-from utils import ROOT_PATH, ASSETS_PATH, DESIRED_SIZE, DEFAULT_IMG_FILEPATH, DEFAULT_IMG_URLPATH, MODEL_FILEPATH, MODEL_URLPATH, KPS_SPIN_MAP
-
-def process_image(img_raw):
-    if not MODEL_FILEPATH.exists():
-        urllib.request.urlretrieve(MODEL_URLPATH, MODEL_FILEPATH)
-
-    model = cv2.dnn.readNetFromONNX(str(MODEL_FILEPATH))
+def process_image(img_raw, model):
 
     pose_input, img, center, scale = get_input(img_raw)
     model.setInput(pose_input[None])
@@ -96,14 +114,7 @@ def process_image(img_raw):
         predicted_heatmap[0],
     )
 
-    img = Image.fromarray(img[..., ::-1])
-    original_img_size = img.size
-    ratio = float(DESIRED_SIZE) / max(original_img_size)
-    resized_img_size = tuple([int(x * ratio) for x in original_img_size])
-    img = img.resize(resized_img_size, Image.ANTIALIAS)
-    original_img_size = max(original_img_size)
-
-    predicted_keypoints *= (DESIRED_SIZE - 1) / (original_img_size - 1)
+    predicted_keypoints, img, resized_img_size = g2pe_coordinate_transformation(img, predicted_keypoints)
 
     predicted_heatmap = predicted_heatmap.sum(0)
     predicted_heatmap_min = predicted_heatmap.min()
@@ -116,47 +127,9 @@ def process_image(img_raw):
 
     return img, predicted_keypoints, confidence, predicted_heatmap
 
-
-names = list(KPS_SPIN_MAP.keys())
-
-idxs_map = []
-for key in KPS_SPIN_MAP:
-    tmp = spin.constants.JOINT_NAMES.index(KPS_SPIN_MAP[key])
-    idxs_map.append(tmp)
-    
-
-def get_pred_and_data(image_path, model_hmr):
-
-    # use spin model => joints_pred_2d
-    img_sp, norm_img = process_image_spin(image_path, None, None, input_res=spin.constants.IMG_RES)
-    pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(device))
-    pred_output = smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], 
-                       global_orient=pred_rotmat[:,0].unsqueeze(1), pose2rot=False)
-    pred_vertices = pred_output.vertices
-
-    joints_pred_3d = pred_output.joints
-    joints_pred_2d = joints_pred_3d[0,:,:2]
-    pred_camera = pred_camera.detach()
-    coef = pred_camera[:,0]
-    camera_translation = torch.stack([pred_camera[:,1], pred_camera[:,2], 2*spin.constants.FOCAL_LENGTH/(spin.constants.IMG_RES * pred_camera[:,0] +1e-9)],dim=-1)
-    camera_translation = camera_translation[0].cpu().numpy()
-
-    #scale to img_sp
-    img_array = np.asarray(img_sp)
-    (m, n) = (img_array.shape[1],img_array.shape[2])
-    joints_pred_2d_scaled = joints_pred_2d
-    joints_pred_2d_scaled[:,0] = m/2 * (coef*(joints_pred_2d_scaled[:,0]+camera_translation[0]) + 1)
-    joints_pred_2d_scaled[:,1] = n/2 * (coef*(joints_pred_2d_scaled[:,1]+camera_translation[1]) + 1)
-
-    # use 2d keypoints detection
-    with open(image_path, "br") as inp:
-        img_raw = inp.read()
-    img_kp, predicted_keypoints, confidence, predicted_heatmap = process_image(img_raw)
-
+def scale_g2pe(predicted_keypoints, size_sp, size_kp):
     # scale to img_sp
-    m1,n1 = np.asarray(img_kp).shape[:2]
-    size_sp = m,n
-    size_kp = m1,n1
+    m1,n1 = size_kp
     if (m1>n1): # vertically
         ax1=1
         ax2=0
@@ -169,17 +142,54 @@ def get_pred_and_data(image_path, model_hmr):
     predicted_keypoints_scaled = np.copy(predicted_keypoints)
     predicted_keypoints_scaled[:,ax2] -= shift
     predicted_keypoints_scaled *= scale
+    
+    return predicted_keypoints_scaled
+    
+    
+def get_data(image_path, model_g2pe, size_sp) :
+    # use 2d keypoints detection
+    with open(image_path, "br") as inp:
+        img_raw = inp.read()
+    img_kp, predicted_keypoints, confidence, predicted_heatmap = process_image(img_raw, model_g2pe)
 
+    # scale to img_sp
+    size_kp = np.asarray(img_kp).shape[:2]
+    predicted_keypoints_scaled = scale_g2pe(predicted_keypoints, size_sp, size_kp)
+    y_data = torch.tensor(predicted_keypoints_scaled)
+    return y_data.to(device)
 
-    y_pred = joints_pred_2d_scaled
-    y_pred = y_pred[idxs_map]
-    y_data = predicted_keypoints_scaled
+def scale_spin(pred_output, pred_camera,size_sp):
+    pred_vertices = pred_output.vertices
+    joints_pred_3d = pred_output.joints
+    joints_pred_2d = joints_pred_3d[0,:,:2]
+    pred_camera = pred_camera.detach()
+    coef = pred_camera[:,0]
+    camera_translation = torch.stack([pred_camera[:,1], pred_camera[:,2], 2*spin.constants.FOCAL_LENGTH/(spin.constants.IMG_RES * pred_camera[:,0] +1e-9)],dim=-1)
+    camera_translation = camera_translation[0].cpu().numpy()
 
-    return y_pred, torch.tensor(y_data)
+    #scale to img_sp
+    (m, n) = size_sp
+    joints_pred_2d_scaled = joints_pred_2d
+    joints_pred_2d_scaled[:,0] = m/2 * (coef*(joints_pred_2d_scaled[:,0]+camera_translation[0]) + 1)
+    joints_pred_2d_scaled[:,1] = n/2 * (coef*(joints_pred_2d_scaled[:,1]+camera_translation[1]) + 1)
+    return joints_pred_2d_scaled
+    
+def get_pred(img_data, model_hmr):
 
-def plot_pred_and_data_skeleton(y_pred,y_data,name, filename,
+    # use spin model => joints_pred_2d
+    img_sp, norm_img, size_sp =  img_data
+    pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(device))
+    pred_output = smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], 
+                       global_orient=pred_rotmat[:,0].unsqueeze(1), pose2rot=False)
+    
+    y_pred = scale_spin(pred_output, pred_camera, size_sp)
+    y_pred = y_pred[IDXS_MAP]
+    
+    return y_pred.to_device(device)
+
+def plot_pred_and_data_skeleton(y_pred, y_data, img_data, filename,
                                 keypoints=KPS, skeleton=SKELETON, width=1, rad=2):
-    img_sp, norm_img = process_image_spin(name, None, None, input_res=spin.constants.IMG_RES)
+    img_sp, norm_img, size_sp = img_data
     
     trans = ToPILImage(mode='RGB')
     img = trans(img_sp.squeeze())
@@ -212,54 +222,9 @@ def plot_pred_and_data_skeleton(y_pred,y_data,name, filename,
     return img
 
 
-
-def plot_pred_and_data(y_pred,y_data,name):
-    img_sp, norm_img = process_image_spin(name, None, None, 
-                                          input_res=spin.constants.IMG_RES)
+def save_3d_model_on_img(img_data, model_hmr, filename):
     
-    scatter1 = y_pred.detach()
-    scatter2 = y_data
-    fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
-    ax.imshow(img_sp.permute(1, 2, 0) )
-    # ax.axis([0, 224, 0, 224])
-    for i in range(len(names)):
-        if (i > 9):
-            marker='+'
-        else:
-            marker='.'
-        ax.scatter(x=[scatter1[i,0],scatter2[i,0]], 
-                    y=[scatter1[i,1],scatter2[i,1]],
-                    label=names[i],marker=marker)
-        ax.text(scatter1[i,0], scatter1[i,1], 
-                "pr", transform=ax.transData)
-    #     ax.text(scatter2[i,0], scatter2[i,1], names[i], transform=ax.transData)
-    #     plt.scatter(x=scatter2[i,0], y=scatter2[i,1])
-    plt.legend()
-    plt.show()
-
-def plot_3D(image_path, model_hmr):
-    img_sp, norm_img = process_image_spin(image_path, None, None, input_res=spin.constants.IMG_RES)
-    with torch.no_grad():
-        pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(device))
-        pred_output = smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], 
-                           global_orient=pred_rotmat[:,0].unsqueeze(1), pose2rot=False)
-        pred_vertices = pred_output.vertices
-
-    points= pred_output.joints
-    x, y, z = points[0,:,0], points[0,:,1], points[0,:,2]
-    points= pred_output.vertices
-    x1, y1, z1 = points[0,:,0], points[0,:,1], points[0,:,2]
-    fig = go.Figure(data=[go.Scatter3d(x=x1, y=y1, z=z1,
-                                       mode='markers', marker_size=2),
-                          go.Scatter3d(x=x, y=y, z=z,
-                                       mode='markers', marker_size=5)])
-
-    fig.show()
-
-
-def save_3d_model_on_img(image_path, model_hmr, filename):
-    
-    img, norm_img = process_image_spin(image_path, None, None, input_res=spin.constants.IMG_RES)
+    img_sp, norm_img, size_sp = img_data
     with torch.no_grad():
         pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(device))
         pred_output = smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], 
@@ -291,7 +256,7 @@ def save_3d_model_on_img(image_path, model_hmr, filename):
     plt.savefig(save_path+'/shape_'+filename)
     
 def loss_parallel(y_pred, y_data):
-    L=0
+    L = 0
     for src, dst in SKELETON:
         v1 = y_pred[dst - 1]- y_pred[src - 1]
         v2 = y_data[dst - 1]- y_data[src - 1]
@@ -300,54 +265,85 @@ def loss_parallel(y_pred, y_data):
     return L
 
 
-from utils import MODEL_HMR_PATH
-    
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--img', type=str, default=None, help='Path to input image')
+ 
 if __name__ == '__main__':
-
-
+    args = parser.parse_args()
+    
+# get img_name
+    dataset_names = glob.glob(LOAD_DIR + '*.jpg')
+    print('Number of sketches : ', len(dataset_names))
+    if args.img ==None:
+        num_of_im = randint(0, len(dataset_names))
+        # !!!
+        img_name = dataset_names[num_of_im]
+    else:
+        img_name = args.img
+    print('Path to image : ', img_name)
+    
+#Fix device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    print(device)
-         # Load pretrained model
+    print('Calculations on device ', device)
+    
+# Load g2pe model
+    if not MODEL_FILEPATH.exists():
+        urllib.request.urlretrieve(MODEL_URLPATH, MODEL_FILEPATH)
+
+    model_g2pe = cv2.dnn.readNetFromONNX(str(MODEL_FILEPATH))
+
+    
+# Load img_sp
+    img, norm_img = process_image_spin(img_name, None, None, input_res=spin.constants.IMG_RES)
+    img_array = np.asarray(img)
+    size_sp = (img_array.shape[1],img_array.shape[2])
+    
+    img_data = img, norm_img, size_sp  
+    
+# get y_data
+    y_data = get_data(img_name, model_g2pe, size_sp)
+    
+    
+# Load pretrained model
     model_hmr = hmr(spin.config.SMPL_MEAN_PARAMS).to(device)
     checkpoint = torch.load(MODEL_HMR_PATH, map_location='cpu')
     model_hmr.load_state_dict(checkpoint['model'], strict=False)
-        # Load SMPL model
+# Load SMPL model
     smpl = SMPL(spin.config.SMPL_MODEL_DIR,
                 batch_size=1,
                 create_transl=False).to(device)
 
+# Freeze layers
     model_hmr.train()
     for module in model_hmr.modules():
-            if isinstance(module, torch.nn.modules.BatchNorm2d):
-                module.eval() 
-            if isinstance(module, torch.nn.modules.Dropout):
-                module.eval()  
-
-    import torch.optim as optim
-    from torch.optim.lr_scheduler import ReduceLROnPlateau
-
-    from os import listdir
-    import glob
-    import os
-    from utils import LOAD_DIR
-    dataset_names = glob.glob(LOAD_DIR + '*.jpg')
-    print(len(dataset_names))
-
-    img_name = dataset_names[10]
-    print(img_name)
-
+        if isinstance(module, torch.nn.modules.BatchNorm2d):
+            module.eval() 
+        if isinstance(module, torch.nn.modules.Dropout):
+            module.eval()  
+     
     with torch.no_grad():
-        y_pred_before, y_data_before = get_pred_and_data(img_name, model_hmr)
-
+        y_pred_before = get_pred(img_data, model_hmr)
+        
+# Save image
+    img_before = plot_pred_and_data_skeleton(y_pred_before, y_data, img_data,filename='after')
+    
+    fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
+    ax.imshow(img_before)
+    plt.title('Before : pred->blue; data->red')
+    path = SAVE_DIR+'/skeleton_before.png'
+    plt.savefig(path)
+    plt.show()
+    
+# Start optimization
     loss_mse = torch.nn.MSELoss()
 
     C = 1000
     lr = 1e-6
-    EPOCHS = 40
-
+    EPOCHS = 50
 
     optimizer = optim.SGD(model_hmr.parameters(), lr=lr) # 6
-
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor = 0.5, 
                                   verbose=True, patience=2)
 
@@ -355,39 +351,28 @@ if __name__ == '__main__':
     list_loss=[]
     for epoch in range(EPOCHS):  
         optimizer.zero_grad()
-        y_pred, y_data = get_pred_and_data(img_name, model_hmr)
+        y_pred = get_pred(img_data, model_hmr)
         loss_value = loss_mse(y_pred, y_data) + C*loss_parallel(y_pred, y_data)
         epoch_loss = loss_value.item()
         loss_value.backward() 
         optimizer.step()
         scheduler.step(epoch_loss)
-        print('Epoch_loss : ', epoch_loss)
+        print('Epoch_loss ', epoch, ' = ', epoch_loss)
         list_loss.append(epoch_loss)
 
     print('Finished training: ','loss before = ', list_loss[0],'; loss after = ', list_loss[-1])
 
-
     with torch.no_grad():
-        y_pred_after, y_data_after = get_pred_and_data(img_name, model_hmr)
-
-    img_before = plot_pred_and_data_skeleton(y_pred_before, y_data_before, img_name,filename='after')
-
-    img_after = plot_pred_and_data_skeleton(y_pred_after, y_data_after, img_name,filename='after')
-
-    from utils import SAVE_DIR 
-
-    fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
-    ax.imshow(img_before)
-    plt.title('pred->blue; data->red')
-    path = SAVE_DIR+'/skeleton_before.png'
-    plt.savefig(path)
-    plt.show()
-
+        y_pred_after = get_pred(img_data, model_hmr)
+    
+        
+# Save image
+    img_after = plot_pred_and_data_skeleton(y_pred_after, y_data, img_data, filename='after')
     fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
     ax.imshow(img_after)
-    plt.title('pred->blue; data->red')
-    plt.savefig(path)
-    plt.show()
+    plt.title('After : pred->blue; data->red')
     path = SAVE_DIR+'/skeleton_after.png'
     plt.savefig(path)
     plt.show()
+    
+    print('The end')

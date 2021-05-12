@@ -1,4 +1,5 @@
 from pathlib import Path
+import spin.constants
 
 ROOT_PATH = Path("g2pe/")
 ASSETS_PATH = ROOT_PATH / "assets"
@@ -35,3 +36,11 @@ MODEL_HMR_PATH = 'spin/data/spin_model.pt'
 
 LOAD_DIR = 'sketches/'
 SAVE_DIR = 'results/'
+
+
+names = list(KPS_SPIN_MAP.keys())
+
+IDXS_MAP = []
+for key in KPS_SPIN_MAP:
+    tmp = spin.constants.JOINT_NAMES.index(KPS_SPIN_MAP[key])
+    IDXS_MAP.append(tmp)
