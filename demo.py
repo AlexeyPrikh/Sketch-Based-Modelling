@@ -35,6 +35,10 @@ import os
 from random import randint 
 from utils import MODEL_HMR_PATH, LOAD_DIR, SAVE_DIR, IDXS_MAP
 
+def get_device():
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    return device
+
 def bbox_from_openpose(openpose_file, rescale=1.2, detection_thresh=0.2):
     """Get center and scale for bounding box from openpose detections."""
     with open(openpose_file, 'r') as f:
@@ -156,7 +160,7 @@ def get_data(image_path, model_g2pe, size_sp) :
     size_kp = np.asarray(img_kp).shape[:2]
     predicted_keypoints_scaled = scale_g2pe(predicted_keypoints, size_sp, size_kp)
     y_data = torch.tensor(predicted_keypoints_scaled)
-    return y_data.to(device)
+    return y_data
 
 def scale_spin(pred_output, pred_camera,size_sp):
     pred_vertices = pred_output.vertices
@@ -178,15 +182,14 @@ def get_pred(img_data, model_hmr):
 
     # use spin model => joints_pred_2d
     img_sp, norm_img, size_sp =  img_data
-    pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(device))
+    pred_rotmat, pred_betas, pred_camera = model_hmr(norm_img.to(get_device()))
     pred_output = smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], 
                        global_orient=pred_rotmat[:,0].unsqueeze(1), pose2rot=False)
     
     y_pred = scale_spin(pred_output, pred_camera, size_sp)
     y_pred = y_pred[IDXS_MAP]
     
-    return y_pred.to_device(device)
-
+    return y_pred
 def plot_pred_and_data_skeleton(y_pred, y_data, img_data, filename,
                                 keypoints=KPS, skeleton=SKELETON, width=1, rad=2):
     img_sp, norm_img, size_sp = img_data
@@ -265,12 +268,15 @@ def loss_parallel(y_pred, y_data):
     return L
 
 
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--img', type=str, default=None, help='Path to input image')
  
 if __name__ == '__main__':
+#Fix device
+#     device = get_device()
+    print('Calculations on device ', get_device())
+    
+    
     args = parser.parse_args()
     
 # get img_name
@@ -283,10 +289,6 @@ if __name__ == '__main__':
     else:
         img_name = args.img
     print('Path to image : ', img_name)
-    
-#Fix device
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    print('Calculations on device ', device)
     
 # Load g2pe model
     if not MODEL_FILEPATH.exists():
@@ -307,18 +309,23 @@ if __name__ == '__main__':
     
     
 # Load pretrained model
-    model_hmr = hmr(spin.config.SMPL_MEAN_PARAMS).to(device)
+    model_hmr = hmr(spin.config.SMPL_MEAN_PARAMS).to(get_device())
     checkpoint = torch.load(MODEL_HMR_PATH, map_location='cpu')
     model_hmr.load_state_dict(checkpoint['model'], strict=False)
 # Load SMPL model
     smpl = SMPL(spin.config.SMPL_MODEL_DIR,
                 batch_size=1,
-                create_transl=False).to(device)
+                create_transl=False).to(get_device())
 
+    
 # Freeze layers
     model_hmr.train()
     for module in model_hmr.modules():
         if isinstance(module, torch.nn.modules.BatchNorm2d):
+            if hasattr(module, 'weight'):
+                module.weight.requires_grad_(False)
+            if hasattr(module, 'bias'):
+                module.bias.requires_grad_(False)
             module.eval() 
         if isinstance(module, torch.nn.modules.Dropout):
             module.eval()  
@@ -347,7 +354,10 @@ if __name__ == '__main__':
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor = 0.5, 
                                   verbose=True, patience=2)
 
+    
+    
     print('Start training')
+    y_data.to(device=get_device())
     list_loss=[]
     for epoch in range(EPOCHS):  
         optimizer.zero_grad()
@@ -361,9 +371,9 @@ if __name__ == '__main__':
         list_loss.append(epoch_loss)
 
     print('Finished training: ','loss before = ', list_loss[0],'; loss after = ', list_loss[-1])
-
+    y_data.cpu()
     with torch.no_grad():
-        y_pred_after = get_pred(img_data, model_hmr)
+        y_pred_after = get_pred(img_data, model_hmr).cpu()
     
         
 # Save image
