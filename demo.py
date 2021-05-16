@@ -39,51 +39,14 @@ def get_device():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     return device
 
-def bbox_from_openpose(openpose_file, rescale=1.2, detection_thresh=0.2):
-    """Get center and scale for bounding box from openpose detections."""
-    with open(openpose_file, 'r') as f:
-        keypoints = json.load(f)['people'][0]['pose_keypoints_2d']
-    keypoints = np.reshape(np.array(keypoints), (-1,3))
-    valid = keypoints[:,-1] > detection_thresh
-    valid_keypoints = keypoints[valid][:,:-1]
-    center = valid_keypoints.mean(axis=0)
-    bbox_size = (valid_keypoints.max(axis=0) - valid_keypoints.min(axis=0)).max()
-    # adjust bounding box tightness
-    scale = bbox_size / 200.0
-    scale *= rescale
-    return center, scale
-
-def bbox_from_json(bbox_file):
-    """Get center and scale of bounding box from bounding box annotations.
-    The expected format is [top_left(x), top_left(y), width, height].
-    """
-    with open(bbox_file, 'r') as f:
-        bbox = np.array(json.load(f)['bbox']).astype(np.float32)
-    ul_corner = bbox[:2]
-    center = ul_corner + 0.5 * bbox[2:]
-    width = max(bbox[2], bbox[3])
-    scale = width / 200.0
-    # make sure the bounding box is rectangular
-    return center, scale
-
-def process_image_spin(img_file, bbox_file, openpose_file, input_res=224):
-    """Read image, do preprocessing and possibly crop it according to the bounding box.
-    If there are bounding box annotations, use them to crop the image.
-    If no bounding box is specified but openpose detections are available, use them to get the bounding box.
-    """
+def process_image_spin(img_file, input_res=224):
     normalize_img = Normalize(mean=spin.constants.IMG_NORM_MEAN, std=spin.constants.IMG_NORM_STD)
-    img = cv2.imread(img_file)[:,:,::-1].copy() # PyTorch does not support negative stride at the moment
-    if bbox_file is None and openpose_file is None:
-        # Assume that the person is centerered in the image
-        height = img.shape[0]
-        width = img.shape[1]
-        center = np.array([width // 2, height // 2])
-        scale = max(height, width) / 200
-    else:
-        if bbox_file is not None:
-            center, scale = bbox_from_json(bbox_file)
-        elif openpose_file is not None:
-            center, scale = bbox_from_openpose(openpose_file)
+    img = cv2.imread(img_file)[:,:,::-1].copy() 
+    # Assume that the person is centerered in the image
+    height = img.shape[0]
+    width = img.shape[1]
+    center = np.array([width // 2, height // 2])
+    scale = max(height, width) / 200
     img = crop(img, center, scale, (input_res, input_res))
     img = img.astype(np.float32) / 255.
     img = torch.from_numpy(img).permute(2,0,1)
@@ -97,9 +60,7 @@ def g2pe_coordinate_transformation(img, predicted_keypoints):
     resized_img_size = tuple([int(x * ratio) for x in original_img_size])
     img = img.resize(resized_img_size, Image.ANTIALIAS)
     original_img_size = max(original_img_size)
-
     predicted_keypoints *= (DESIRED_SIZE - 1) / (original_img_size - 1)
-    
     return predicted_keypoints, img, resized_img_size
 
 
@@ -111,13 +72,11 @@ def process_image(img_raw, model):
     predicted_keypoints, confidence = get_final_preds(
         predicted_heatmap, center[None], scale[None], post_process=True
     )
-
     predicted_keypoints, confidence, predicted_heatmap = (
         predicted_keypoints[0],
         confidence[0],
         predicted_heatmap[0],
     )
-
     predicted_keypoints, img, resized_img_size = g2pe_coordinate_transformation(img, predicted_keypoints)
 
     predicted_heatmap = predicted_heatmap.sum(0)
@@ -150,7 +109,7 @@ def scale_g2pe(predicted_keypoints, size_sp, size_kp):
     return predicted_keypoints_scaled
     
     
-def get_data(image_path, model_g2pe, size_sp) :
+def get_g2pe_estim(image_path, model_g2pe, size_sp) :
     # use 2d keypoints detection
     with open(image_path, "br") as inp:
         img_raw = inp.read()
@@ -159,8 +118,8 @@ def get_data(image_path, model_g2pe, size_sp) :
     # scale to img_sp
     size_kp = np.asarray(img_kp).shape[:2]
     predicted_keypoints_scaled = scale_g2pe(predicted_keypoints, size_sp, size_kp)
-    y_data = torch.tensor(predicted_keypoints_scaled)
-    return y_data
+    y_g2pe_estim = torch.tensor(predicted_keypoints_scaled)
+    return y_g2pe_estim
 
 def scale_spin(pred_output, pred_camera,size_sp):
     pred_vertices = pred_output.vertices
@@ -178,7 +137,7 @@ def scale_spin(pred_output, pred_camera,size_sp):
     joints_pred_2d_scaled[:,1] = n/2 * (coef*(joints_pred_2d_scaled[:,1]+camera_translation[1]) + 1)
     return joints_pred_2d_scaled
     
-def get_pred(img_data, model_hmr):
+def get_pred(img_data, model_hmr, smpl):
 
     # use spin model => joints_pred_2d
     img_sp, norm_img, size_sp =  img_data
@@ -190,7 +149,8 @@ def get_pred(img_data, model_hmr):
     y_pred = y_pred[IDXS_MAP]
     
     return y_pred
-def plot_pred_and_data_skeleton(y_pred, y_data, img_data, filename,
+
+def plot_pred_and_data_skeleton(y_pred, y_g2pe_estim, img_data, filename,
                                 keypoints=KPS, skeleton=SKELETON, width=1, rad=2):
     img_sp, norm_img, size_sp = img_data
     
@@ -198,7 +158,7 @@ def plot_pred_and_data_skeleton(y_pred, y_data, img_data, filename,
     img = trans(img_sp.squeeze())
     draw = ImageDraw.Draw(img)
     
-    kps = y_data
+    kps = y_g2pe_estim
     for name, (x, y) in zip(keypoints, kps):
         draw.ellipse([x - rad, y - rad, x + rad, y + rad], fill="red", width=width)
     for src, dst in skeleton:
@@ -215,13 +175,13 @@ def plot_pred_and_data_skeleton(y_pred, y_data, img_data, filename,
         x2, y2 = kps[dst - 1]
         draw.line([x1, y1, x2, y2], fill="blue", width=width)
     
+    
     fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
     ax.imshow(img)
-    plt.title('pred->blue; data->red')
+    plt.title('Before : pred->blue; g2pe_estim->red')
+    path = SAVE_DIR+'/' + filename + '.png'
+    plt.savefig(path)
     plt.show()
-#     path = save_path+'/skeleton'+filename+'png'
-    
-#     plt.savefig(save_path+'/shape_'+filename)
     return img
 
 
@@ -267,15 +227,21 @@ def loss_parallel(y_pred, y_data):
         L += cos
     return L
 
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--img', type=str, default=None, help='Path to input image')
- 
-if __name__ == '__main__':
-#Fix device
-#     device = get_device()
-    print('Calculations on device ', get_device())
+def freeze_layer(model_hmr):
+    for module in model_hmr.modules():
+        if isinstance(module, torch.nn.modules.BatchNorm2d):
+            if hasattr(module, 'weight'):
+                module.weight.requires_grad_(False)
+            if hasattr(module, 'bias'):
+                module.bias.requires_grad_(False)
+            module.eval() 
+        if isinstance(module, torch.nn.modules.Dropout):
+            module.eval()  
     
+    
+def main():
+    #Fix device
+    print('Calculations on device ', get_device())
     
     args = parser.parse_args()
     
@@ -283,7 +249,7 @@ if __name__ == '__main__':
     dataset_names = glob.glob(LOAD_DIR + '*.jpg')
     print('Number of sketches : ', len(dataset_names))
     if args.img ==None:
-        num_of_im = randint(0, len(dataset_names))
+        num_of_im = randint(0, len(dataset_names)-1)
         # !!!
         img_name = dataset_names[num_of_im]
     else:
@@ -298,14 +264,14 @@ if __name__ == '__main__':
 
     
 # Load img_sp
-    img, norm_img = process_image_spin(img_name, None, None, input_res=spin.constants.IMG_RES)
+    img, norm_img = process_image_spin(img_name, input_res=spin.constants.IMG_RES)
     img_array = np.asarray(img)
     size_sp = (img_array.shape[1],img_array.shape[2])
     
     img_data = img, norm_img, size_sp  
     
 # get y_data
-    y_data = get_data(img_name, model_g2pe, size_sp)
+    y_g2pe_estim = get_g2pe_estim(img_name, model_g2pe, size_sp)
     
     
 # Load pretrained model
@@ -320,28 +286,13 @@ if __name__ == '__main__':
     
 # Freeze layers
     model_hmr.train()
-    for module in model_hmr.modules():
-        if isinstance(module, torch.nn.modules.BatchNorm2d):
-            if hasattr(module, 'weight'):
-                module.weight.requires_grad_(False)
-            if hasattr(module, 'bias'):
-                module.bias.requires_grad_(False)
-            module.eval() 
-        if isinstance(module, torch.nn.modules.Dropout):
-            module.eval()  
+    freeze_layer(model_hmr)
      
     with torch.no_grad():
-        y_pred_before = get_pred(img_data, model_hmr)
+        y_pred_before = get_pred(img_data, model_hmr, smpl)
         
 # Save image
-    img_before = plot_pred_and_data_skeleton(y_pred_before, y_data, img_data,filename='after')
-    
-    fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
-    ax.imshow(img_before)
-    plt.title('Before : pred->blue; data->red')
-    path = SAVE_DIR+'/skeleton_before.png'
-    plt.savefig(path)
-    plt.show()
+    img_before = plot_pred_and_data_skeleton(y_pred_before, y_g2pe_estim, img_data,filename='skeleton_before')
     
 # Start optimization
     loss_mse = torch.nn.MSELoss()
@@ -354,15 +305,13 @@ if __name__ == '__main__':
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor = 0.5, 
                                   verbose=True, patience=2)
 
-    
-    
     print('Start training')
-    y_data.to(device=get_device())
+    y_g2pe_estim.to(device=get_device())
     list_loss=[]
     for epoch in range(EPOCHS):  
         optimizer.zero_grad()
-        y_pred = get_pred(img_data, model_hmr)
-        loss_value = loss_mse(y_pred, y_data) + C*loss_parallel(y_pred, y_data)
+        y_pred = get_pred(img_data, model_hmr, smpl)
+        loss_value = loss_mse(y_pred, y_g2pe_estim) + C*loss_parallel(y_pred, y_g2pe_estim)
         epoch_loss = loss_value.item()
         loss_value.backward() 
         optimizer.step()
@@ -371,18 +320,18 @@ if __name__ == '__main__':
         list_loss.append(epoch_loss)
 
     print('Finished training: ','loss before = ', list_loss[0],'; loss after = ', list_loss[-1])
-    y_data.cpu()
+    y_g2pe_estim.cpu()
     with torch.no_grad():
-        y_pred_after = get_pred(img_data, model_hmr).cpu()
+        y_pred_after = get_pred(img_data, model_hmr, smpl).cpu()
     
         
 # Save image
-    img_after = plot_pred_and_data_skeleton(y_pred_after, y_data, img_data, filename='after')
-    fig, ax = plt.subplots(facecolor='lightgray',figsize=(16,10))
-    ax.imshow(img_after)
-    plt.title('After : pred->blue; data->red')
-    path = SAVE_DIR+'/skeleton_after.png'
-    plt.savefig(path)
-    plt.show()
+    img_after = plot_pred_and_data_skeleton(y_pred_after, y_g2pe_estim, img_data, filename='skeleton_after')
     
     print('The end')
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--img', type=str, default=None, help='Path to input image')
+ 
+if __name__ == '__main__':
+    main()
